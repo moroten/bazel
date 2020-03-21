@@ -247,6 +247,31 @@ public class RemoteCache implements AutoCloseable {
   }
 
   /**
+   * Upload an alias for an action to the remote cache.
+   *
+   * @throws IOException if there was an error uploading to the remote cache
+   */
+  public void uploadAlias(
+      ActionKey fakeActionKey,
+      ActionKey actualActionKey,
+      Action actualAction)
+      throws IOException, InterruptedException {
+    if (!actualAction.getDoNotCache()) {
+      // First make sure the action itself is present.
+      // Could check for missing blob first, but one extra round trip is unnecessary as the action is small.
+      cacheProtocol.uploadBlob(actualActionKey.getDigest(), actualAction.toByteString());
+
+      ActionResult.Builder resultBuilder = ActionResult.newBuilder();
+      resultBuilder.setExitCode(0);
+      // Remote caches might expect both stdout and stderr to be set, so set both.
+      resultBuilder.setStdoutDigest(actualActionKey.getDigest());
+      resultBuilder.setStderrDigest(actualActionKey.getDigest());
+      ActionResult result = resultBuilder.build();
+      cacheProtocol.uploadActionResult(fakeActionKey, result);
+    }
+  }
+
+  /**
    * Downloads a blob with content hash {@code digest} and stores its content in memory.
    *
    * @return a future that completes after the download completes (succeeds / fails). If successful,

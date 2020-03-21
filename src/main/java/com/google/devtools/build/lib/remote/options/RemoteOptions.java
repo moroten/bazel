@@ -188,6 +188,22 @@ public final class RemoteOptions extends OptionsBase {
   public String remoteLocalFallbackStrategy;
 
   @Option(
+      name = "experimental_remote_accept_action_aliases",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help = "Whether to accept remotely cached action aliases.")
+  public boolean remoteAcceptActionAliases;
+
+  @Option(
+      name = "experimental_remote_upload_action_aliases",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help = "Whether to upload locally calculated action aliases to the remote cache.")
+  public boolean remoteUploadActionAliases;
+
+  @Option(
       name = "remote_upload_local_results",
       defaultValue = "true",
       documentationCategory = OptionDocumentationCategory.REMOTE,

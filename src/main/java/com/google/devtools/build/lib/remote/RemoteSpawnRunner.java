@@ -47,13 +47,17 @@ import com.google.devtools.build.lib.actions.ActionInput;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.CommandLines.ParamFileActionInput;
 import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.FileArtifactValue;
+import com.google.devtools.build.lib.actions.MetadataProvider;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.actions.SpawnMetrics;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.SpawnResult.Status;
 import com.google.devtools.build.lib.actions.Spawns;
+import com.google.devtools.build.lib.actions.cache.DigestUtils;
 import com.google.devtools.build.lib.actions.cache.VirtualActionInput;
 import com.google.devtools.build.lib.analysis.platform.PlatformUtils;
+import com.google.devtools.build.lib.collect.nestedset.Order;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.Reporter;
@@ -74,6 +78,7 @@ import com.google.devtools.build.lib.remote.util.TracingMetadataUtils;
 import com.google.devtools.build.lib.remote.util.Utils;
 import com.google.devtools.build.lib.remote.util.Utils.InMemoryOutput;
 import com.google.devtools.build.lib.util.ExitCode;
+import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.devtools.build.lib.util.io.FileOutErr;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
@@ -99,6 +104,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
@@ -160,6 +166,8 @@ public class RemoteSpawnRunner implements SpawnRunner {
    */
   private final ImmutableSet<ActionInput> filesToDownload;
 
+  private final FastInputKeyCache fastInputKeyCache = new FastInputKeyCache();
+
   // Used to ensure that a warning is reported only once.
   private final AtomicBoolean warningReported = new AtomicBoolean();
 
@@ -205,15 +213,10 @@ public class RemoteSpawnRunner implements SpawnRunner {
     boolean uploadLocalResults = remoteOptions.remoteUploadLocalResults && spawnCacheableRemotely;
     boolean acceptCachedResult = remoteOptions.remoteAcceptCached && spawnCacheableRemotely;
 
+    Profiler prof = Profiler.instance();
     context.report(ProgressStatus.EXECUTING, getName());
     RemoteOutputsMode remoteOutputsMode = remoteOptions.remoteOutputsMode;
-    SortedMap<PathFragment, ActionInput> inputMap = context.getInputMapping(true);
-    final MerkleTree merkleTree =
-        MerkleTree.build(inputMap, context.getMetadataProvider(), execRoot, digestUtil);
-    SpawnMetrics.Builder spawnMetrics =
-        new SpawnMetrics.Builder()
-            .setInputBytes(merkleTree.getInputBytes())
-            .setInputFiles(merkleTree.getInputFiles());
+    SpawnMetrics.Builder spawnMetrics = new SpawnMetrics.Builder();
     maybeWriteParamFilesLocally(spawn);
 
     // Get the remote platform properties.
@@ -227,22 +230,18 @@ public class RemoteSpawnRunner implements SpawnRunner {
             platform,
             /* workingDirectory= */ null);
     Digest commandHash = digestUtil.compute(command);
-    Action action =
-        buildAction(
-            commandHash, merkleTree.getRootDigest(), context.getTimeout(), spawnCacheableRemotely);
-
-    spawnMetrics.setParseTime(totalTime.elapsed());
+    NetworkTime networkTime = new NetworkTime();
+    RemoteActionKey remoteActionKey = new RemoteActionKey(
+        context, spawn, digestUtil, remoteCache, fastInputKeyCache, execRoot, commandHash,
+        buildRequestId, commandId, spawnMetrics, networkTime, remoteOptions, spawnCacheableRemotely);
 
     Preconditions.checkArgument(
         Spawns.mayBeExecutedRemotely(spawn), "Spawn can't be executed remotely. This is a bug.");
-    NetworkTime networkTime = new NetworkTime();
-    // Look up action cache, and reuse the action output if it is found.
-    ActionKey actionKey = digestUtil.computeActionKey(action);
+    ActionKey actionKey = remoteActionKey.getActionKey();
     Context withMetadata =
         TracingMetadataUtils.contextWithMetadata(buildRequestId, commandId, actionKey)
             .withValue(NetworkTime.CONTEXT_KEY, networkTime);
     Context previous = withMetadata.attach();
-    Profiler prof = Profiler.instance();
     try {
       try {
         // Try to lookup the action in the action cache.
@@ -261,7 +260,7 @@ public class RemoteSpawnRunner implements SpawnRunner {
             acceptCachedResult = false;
           } else {
             try {
-              return downloadAndFinalizeSpawnResult(
+              return uploadAliasOnSuccess(downloadAndFinalizeSpawnResult(
                   actionKey.getDigest().getHash(),
                   cachedResult,
                   /* cacheHit= */ true,
@@ -270,7 +269,7 @@ public class RemoteSpawnRunner implements SpawnRunner {
                   remoteOutputsMode,
                   totalTime,
                   networkTime::getDuration,
-                  spawnMetrics);
+                  spawnMetrics), remoteActionKey);
             } catch (BulkTransferException e) {
               if (!e.onlyCausedByCacheNotFoundException()) {
                 throw e;
@@ -282,8 +281,10 @@ public class RemoteSpawnRunner implements SpawnRunner {
           }
         }
       } catch (IOException e) {
-        return execLocallyAndUploadOrFail(
-            spawn, context, inputMap, actionKey, action, command, uploadLocalResults, e);
+        return uploadAliasOnSuccess(
+            execLocallyAndUploadOrFail(
+                spawn, context, remoteActionKey.getInputMap(), actionKey, remoteActionKey.getAction(), command, uploadLocalResults, e),
+            remoteActionKey);
       }
 
       ExecuteRequest.Builder requestBuilder =
@@ -309,8 +310,9 @@ public class RemoteSpawnRunner implements SpawnRunner {
               // Upload the command and all the inputs into the remote cache.
               try (SilentCloseable c = prof.profile(UPLOAD_TIME, "upload missing inputs")) {
                 Map<Digest, Message> additionalInputs = Maps.newHashMapWithExpectedSize(2);
-                additionalInputs.put(actionKey.getDigest(), action);
+                additionalInputs.put(actionKey.getDigest(), remoteActionKey.getAction());
                 additionalInputs.put(commandHash, command);
+                MerkleTree merkleTree = remoteActionKey.getMerkleTree();
                 Duration networkTimeStart = networkTime.getDuration();
                 Stopwatch uploadTime = Stopwatch.createStarted();
                 remoteCache.ensureInputsPresent(merkleTree, additionalInputs);
@@ -341,7 +343,7 @@ public class RemoteSpawnRunner implements SpawnRunner {
               }
 
               try {
-                return downloadAndFinalizeSpawnResult(
+                return uploadAliasOnSuccess(downloadAndFinalizeSpawnResult(
                     actionKey.getDigest().getHash(),
                     actionResult,
                     reply.getCachedResult(),
@@ -350,7 +352,7 @@ public class RemoteSpawnRunner implements SpawnRunner {
                     remoteOutputsMode,
                     totalTime,
                     networkTime::getDuration,
-                    spawnMetrics);
+                    spawnMetrics), remoteActionKey);
               } catch (BulkTransferException e) {
                 if (e.onlyCausedByCacheNotFoundException()) {
                   // No cache hit, so if we retry this execution, we must no longer accept
@@ -361,8 +363,10 @@ public class RemoteSpawnRunner implements SpawnRunner {
               }
             });
       } catch (IOException e) {
-        return execLocallyAndUploadOrFail(
-            spawn, context, inputMap, actionKey, action, command, uploadLocalResults, e);
+        return uploadAliasOnSuccess(
+            execLocallyAndUploadOrFail(
+                spawn, context, remoteActionKey.getInputMap(), actionKey, remoteActionKey.getAction(), command, uploadLocalResults, e),
+            remoteActionKey);
       }
     } finally {
       withMetadata.detach(previous);
@@ -559,6 +563,27 @@ public class RemoteSpawnRunner implements SpawnRunner {
           spawn, context, inputMap, actionKey, action, command, uploadLocalResults);
     }
     return handleError(cause, context.getFileOutErr(), actionKey, context);
+  }
+
+  private SpawnResult uploadAliasOnSuccess(
+      SpawnResult result,
+      RemoteActionKey remoteActionKey)
+      throws IOException, InterruptedException {
+    Preconditions.checkNotNull(remoteActionKey, "remoteActionKey");
+    if (remoteActionKey.uploadActionAlias()
+        && result != null && Status.SUCCESS.equals(result.status()) && result.exitCode() == 0) {
+      try (SilentCloseable c = Profiler.instance().profile(UPLOAD_TIME, "upload alias")) {
+        remoteCache.uploadAlias(
+            remoteActionKey.getAliasActionKey(), remoteActionKey.getActionKey(), remoteActionKey.getAction());
+      } catch (IOException e) {
+        if (verboseFailures) {
+          report(Event.debug("Upload to remote cache failed: " + e.getMessage()));
+        } else {
+          reportOnce(Event.warn("An action alias failed uploading to the remote cache."));
+        }
+      }
+    }
+    return result;
   }
 
   private SpawnResult handleError(

@@ -168,6 +168,7 @@ public class RemoteSpawnRunnerTest {
     // It should be executed remotely, but marked non-cacheable to remote execution, so that
     // the action result is not saved in the remote cache.
 
+    remoteOptions.remoteAcceptActionAliases = false;
     remoteOptions.remoteAcceptCached = true;
     remoteOptions.remoteLocalFallback = false;
     remoteOptions.remoteUploadLocalResults = true;
