@@ -595,7 +595,7 @@ public final class SkyframeActionExecutor {
       throw e.toActionExecutionException(action);
     }
 
-    try {
+    try (SilentCloseable d = profiler.profile(ProfilerTask.ACTION_CHECK, "updateActionCache")) {
       actionCacheChecker.updateActionCache(
           action, token, metadataHandler, clientEnv, remoteDefaultProperties);
     } catch (IOException e) {

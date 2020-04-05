@@ -30,6 +30,7 @@ import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
+import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.supplier.InterruptibleSupplier;
 import com.google.devtools.build.lib.util.GroupedList.GroupedListHelper;
 import com.google.devtools.build.skyframe.EvaluationProgressReceiver.EvaluationState;
@@ -389,7 +390,8 @@ abstract class AbstractParallelEvaluator {
     @Override
     public void run() {
       SkyFunctionEnvironment env = null;
-      try {
+      try (SilentCloseable c = Profiler.instance().profile(
+          ProfilerTask.INFO, "run " + skyKey.functionName().toString())) {
         NodeEntry state =
             Preconditions.checkNotNull(graph.get(null, Reason.EVALUATION, skyKey), skyKey);
         Preconditions.checkState(state.isReady(), "%s %s", skyKey, state);
@@ -433,7 +435,7 @@ abstract class AbstractParallelEvaluator {
         SkyValue value = null;
         long startTimeNanos = BlazeClock.instance().nanoTime();
         try {
-          try {
+          try (SilentCloseable c2 = Profiler.instance().profile(ProfilerTask.INFO, "compute " + skyKey.argument().toString())) {
             evaluatorContext.getProgressReceiver().stateStarting(skyKey, NodeState.COMPUTE);
             value = factory.compute(skyKey, env);
           } finally {

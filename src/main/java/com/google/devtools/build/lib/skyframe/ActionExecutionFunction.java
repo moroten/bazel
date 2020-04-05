@@ -232,8 +232,11 @@ public class ActionExecutionFunction implements SkyFunction {
 
     NestedSet<Artifact> allInputs = state.allInputs.getAllInputs();
 
-    Map<SkyKey, ValueOrException2<IOException, ActionExecutionException>> inputDeps =
+    Map<SkyKey, ValueOrException2<IOException, ActionExecutionException>> inputDeps;
+    try (SilentCloseable c = Profiler.instance().profile(ProfilerTask.INFO, "getInputDeps")) {
+      inputDeps =
         getInputDeps(env, allInputs, state);
+    }
     // If there's a missing value.
     if (inputDeps == null) {
       return null;
@@ -1138,6 +1141,7 @@ public class ActionExecutionFunction implements SkyFunction {
       NestedSet<Artifact> allInputs,
       ImmutableSet<Artifact> mandatoryInputs)
       throws ActionExecutionException, InterruptedException {
+    try (SilentCloseable c = Profiler.instance().profile(ProfilerTask.INFO, "checkInputs")) {
     return accumulateInputs(
         env,
         action,
@@ -1146,6 +1150,7 @@ public class ActionExecutionFunction implements SkyFunction {
         mandatoryInputs,
         ActionInputMap::new,
         CheckInputResults::new);
+    }
   }
 
   /**

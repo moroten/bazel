@@ -1191,7 +1191,7 @@ public class CppCompileAction extends AbstractAction implements IncludeScannable
   final void updateActionInputs(NestedSet<Artifact> discoveredInputs) {
     Preconditions.checkState(
         discoversInputs(), "Can't call if not discovering inputs: %s %s", discoveredInputs, this);
-    try (SilentCloseable c = Profiler.instance().profile(ProfilerTask.ACTION_UPDATE, describe())) {
+    try (SilentCloseable c = Profiler.instance().profile(ProfilerTask.ACTION_UPDATE, "cppUpdateActionInputs")) {
       NestedSetBuilder<Artifact> inputsBuilder =
           NestedSetBuilder.<Artifact>stableOrder()
               .addTransitive(mandatoryInputs)
@@ -1803,6 +1803,13 @@ public class CppCompileAction extends AbstractAction implements IncludeScannable
 
     @Override
     public ActionContinuationOrResult execute()
+        throws ActionExecutionException, InterruptedException {
+      try (SilentCloseable c = Profiler.instance().profile(ProfilerTask.ACTION_UPDATE, "discoverCppHeaders")) {
+        return executeImpl();
+      }
+    }
+
+    private ActionContinuationOrResult executeImpl()
         throws ActionExecutionException, InterruptedException {
       List<SpawnResult> spawnResults;
       byte[] dotDContents;

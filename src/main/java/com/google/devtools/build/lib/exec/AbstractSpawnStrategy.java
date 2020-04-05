@@ -143,7 +143,7 @@ public abstract class AbstractSpawnStrategy implements SandboxedSpawnStrategy {
 
     SpawnLogContext spawnLogContext = actionExecutionContext.getContext(SpawnLogContext.class);
     if (spawnLogContext != null) {
-      try {
+      try (SilentCloseable c = Profiler.instance().profile("AbstractSpawnStrategy.logSpawn")) {
         spawnLogContext.logSpawn(
             spawn,
             actionExecutionContext.getMetadataProvider(),
