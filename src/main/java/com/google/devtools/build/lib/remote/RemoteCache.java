@@ -28,7 +28,10 @@ import build.bazel.remote.execution.v2.OutputFile;
 import build.bazel.remote.execution.v2.OutputSymlink;
 import build.bazel.remote.execution.v2.SymlinkNode;
 import build.bazel.remote.execution.v2.Tree;
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -46,6 +49,8 @@ import com.google.devtools.build.lib.actions.FileArtifactValue.RemoteFileArtifac
 import com.google.devtools.build.lib.actions.UserExecException;
 import com.google.devtools.build.lib.actions.cache.MetadataInjector;
 import com.google.devtools.build.lib.concurrent.ThreadSafety;
+import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.exec.SpawnRunner.SpawnExecutionContext;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
@@ -70,6 +75,7 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -78,6 +84,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
@@ -100,20 +107,104 @@ public class RemoteCache implements AutoCloseable {
     ((SettableFuture<byte[]>) EMPTY_BYTES).set(new byte[0]);
   }
 
+  private static long inMemoryCasMaxBlobSize = 0;
+  private static Duration inMemoryCasExpiration = Duration.ZERO;
+  private static long inMemoryCasSizeBytes = 0;
+  private static boolean inMemoryCasHasBeenConfigured = false;
+  private static Cache<Digest, byte[]> inMemoryCas = CacheBuilder.newBuilder().maximumSize(0).build();
+  private static Duration inMemoryAcExpiration = Duration.ZERO;
+  private static long inMemoryAcSize = 0;
+  private static boolean inMemoryAcHasBeenConfigured = false;
+  private static Cache<ActionKey, ActionResult> inMemoryAc = CacheBuilder.newBuilder().maximumSize(0).build();
+
   protected final RemoteCacheClient cacheProtocol;
   protected final RemoteOptions options;
   protected final DigestUtil digestUtil;
 
   public RemoteCache(
-      RemoteCacheClient cacheProtocol, RemoteOptions options, DigestUtil digestUtil) {
+    RemoteCacheClient cacheProtocol, RemoteOptions options, DigestUtil digestUtil) {
     this.cacheProtocol = cacheProtocol;
     this.options = options;
     this.digestUtil = digestUtil;
   }
 
+  public static synchronized void updateInMemoryStorage(
+      EventHandler eventHandler, RemoteOptions options) {
+    // Only update the numbers if the have been set, do not use the default values.
+    if (options.remoteInMemoryCasMaxBlobSize != -1) {
+      // inMemoryCasMaxBlobSize can chnge without recreating the cache.
+      inMemoryCasMaxBlobSize = options.remoteInMemoryCasMaxBlobSize;
+    }
+    ArrayList<String> casOptionsDiff = new ArrayList();
+    if (!options.remoteInMemoryCasExpiration.isZero() &&
+        !options.remoteInMemoryCasExpiration.equals(inMemoryCasExpiration)) {
+      casOptionsDiff.add(String.format(
+        "expiration (%s -> %s)",
+        inMemoryCasExpiration.toString(),
+        options.remoteInMemoryCasExpiration.toString()));
+      inMemoryCasExpiration = options.remoteInMemoryCasExpiration;
+    }
+    if (options.remoteInMemoryCasSizeBytes != -1 &&
+        options.remoteInMemoryCasSizeBytes != inMemoryCasSizeBytes) {
+      casOptionsDiff.add(String.format(
+        "size (%d -> %d bytes)", inMemoryCasSizeBytes, options.remoteInMemoryCasSizeBytes));
+      inMemoryCasSizeBytes = options.remoteInMemoryCasSizeBytes;
+    }
+    if (!casOptionsDiff.isEmpty()) {
+      if (inMemoryCasHasBeenConfigured) {
+        eventHandler.handle(Event.info(String.format(
+          "Discarding in-memory remote CAS because the %s changed.",
+          Joiner.on(" and ").join(casOptionsDiff))));
+      }
+      inMemoryCasHasBeenConfigured = true;
+      inMemoryCas = CacheBuilder.newBuilder()
+          // Assume that access is only done after an Action Cache access.
+          .expireAfterAccess(inMemoryCasExpiration.getSeconds(), TimeUnit.SECONDS)
+          .maximumWeight(inMemoryCasSizeBytes)
+          // 64 for the Digest and Cache entry. Is that correct?
+          .weigher((Digest key, byte[] value) -> 64 + value.length)
+          .build();
+    }
+
+    ArrayList<String> acOptionsDiff = new ArrayList();
+    if (!options.remoteInMemoryAcExpiration.isZero() &&
+        !options.remoteInMemoryAcExpiration.equals(inMemoryAcExpiration)) {
+      acOptionsDiff.add(String.format(
+        "expiration (%s -> %s)",
+        inMemoryAcExpiration.toString(),
+        options.remoteInMemoryAcExpiration.toString()));
+      inMemoryAcExpiration = options.remoteInMemoryAcExpiration;
+    }
+    if (options.remoteInMemoryAcSize != -1 &&
+        options.remoteInMemoryAcSize != inMemoryAcSize) {
+      acOptionsDiff.add(String.format(
+        "size (%d -> %d entries)", inMemoryAcSize, options.remoteInMemoryAcSize));
+      inMemoryAcSize = options.remoteInMemoryAcSize;
+    }
+    if (!acOptionsDiff.isEmpty()) {
+      if (inMemoryAcHasBeenConfigured) {
+        eventHandler.handle(Event.info(String.format(
+          "Discarding in-memory remote action cache because the %s changed.",
+          Joiner.on(" and ").join(acOptionsDiff))));
+      }
+      inMemoryAcHasBeenConfigured = true;
+      inMemoryAc = CacheBuilder.newBuilder()
+          .expireAfterWrite(inMemoryAcExpiration.getSeconds(), TimeUnit.SECONDS)
+          .maximumSize(inMemoryAcSize)
+          .build();
+    }
+  }
+
   public ActionResult downloadActionResult(ActionKey actionKey, boolean inlineOutErr)
       throws IOException, InterruptedException {
-    return getFromFuture(cacheProtocol.downloadActionResult(actionKey, inlineOutErr));
+    ActionResult result = inMemoryAc.getIfPresent(actionKey);
+    if (result == null) {
+      result = getFromFuture(cacheProtocol.downloadActionResult(actionKey, inlineOutErr));
+      if (result != null) {
+        inMemoryAc.put(actionKey, result);
+      }
+    }
+    return result;
   }
 
   /**
@@ -137,6 +228,7 @@ public class RemoteCache implements AutoCloseable {
     ActionResult result = resultBuilder.build();
     if (exitCode == 0 && !action.getDoNotCache()) {
       cacheProtocol.uploadActionResult(actionKey, result);
+      inMemoryAc.put(actionKey, result);
     }
     return result;
   }
@@ -257,8 +349,8 @@ public class RemoteCache implements AutoCloseable {
       Action actualAction)
       throws IOException, InterruptedException {
     if (!actualAction.getDoNotCache()) {
-      // First make sure the action itself is present.
-      // Could check for missing blob first, but one extra round trip is unnecessary as the action is small.
+      // First make sure the action itself is present. Could check for missing blob first, but one
+      // extra round trip is unnecessary as an action is small (about 142 bytes).
       cacheProtocol.uploadBlob(actualActionKey.getDigest(), actualAction.toByteString());
 
       ActionResult.Builder resultBuilder = ActionResult.newBuilder();
@@ -268,6 +360,7 @@ public class RemoteCache implements AutoCloseable {
       resultBuilder.setStderrDigest(actualActionKey.getDigest());
       ActionResult result = resultBuilder.build();
       cacheProtocol.uploadActionResult(fakeActionKey, result);
+      inMemoryAc.put(fakeActionKey, result);
     }
   }
 
@@ -281,14 +374,23 @@ public class RemoteCache implements AutoCloseable {
     if (digest.getSizeBytes() == 0) {
       return EMPTY_BYTES;
     }
-    ByteArrayOutputStream bOut = new ByteArrayOutputStream((int) digest.getSizeBytes());
     SettableFuture<byte[]> outerF = SettableFuture.create();
+    byte[] cachedData = inMemoryCas.getIfPresent(digest);
+    if (cachedData != null) {
+      outerF.set(cachedData);
+      return outerF;
+    }
+    ByteArrayOutputStream bOut = new ByteArrayOutputStream((int) digest.getSizeBytes());
     Futures.addCallback(
         cacheProtocol.downloadBlob(digest, bOut),
         new FutureCallback<Void>() {
           @Override
           public void onSuccess(Void aVoid) {
-            outerF.set(bOut.toByteArray());
+            byte[] data = bOut.toByteArray();
+            outerF.set(data);
+            if (data.length <= inMemoryCasMaxBlobSize) {
+              inMemoryCas.put(digest, data);
+            }
           }
 
           @Override
@@ -467,7 +569,23 @@ public class RemoteCache implements AutoCloseable {
 
     OutputStream out = new LazyFileOutputStream(path);
     SettableFuture<Void> outerF = SettableFuture.create();
-    ListenableFuture<Void> f = cacheProtocol.downloadBlob(digest, out);
+    ListenableFuture<Void> f;
+    if (digest.getSizeBytes() <= inMemoryCasMaxBlobSize) {
+      f = Futures.transformAsync(
+          downloadBlob(digest),
+          (data) -> {
+            try {
+              out.write(data);
+              out.flush();
+              return Futures.immediateFuture(null);
+            } catch (IOException e) {
+              return Futures.immediateFailedFuture(e);
+            }
+          },
+          directExecutor());
+    } else {
+      f = cacheProtocol.downloadBlob(digest, out);
+    }
     Futures.addCallback(
         f,
         new FutureCallback<Void>() {
@@ -508,11 +626,27 @@ public class RemoteCache implements AutoCloseable {
         downloads.add(Futures.immediateFailedFuture(e));
       }
     } else if (result.hasStdoutDigest()) {
-      downloads.add(
-          Futures.transform(
-              cacheProtocol.downloadBlob(result.getStdoutDigest(), outErr.getOutputStream()),
-              (d) -> null,
-              directExecutor()));
+      if (result.getStdoutDigest().getSizeBytes() <= inMemoryCasMaxBlobSize) {
+        downloads.add(
+            Futures.transformAsync(
+                downloadBlob(result.getStdoutDigest()),
+                (data) -> {
+                  try {
+                    outErr.getOutputStream().write(data);
+                    outErr.getOutputStream().flush();
+                    return Futures.immediateFuture(null);
+                  } catch (IOException e) {
+                    return Futures.immediateFailedFuture(e);
+                  }
+                },
+                directExecutor()));
+      } else {
+        downloads.add(
+            Futures.transform(
+                cacheProtocol.downloadBlob(result.getStdoutDigest(), outErr.getOutputStream()),
+                (d) -> null,
+                directExecutor()));
+      }
     }
     if (!result.getStderrRaw().isEmpty()) {
       try {
@@ -522,11 +656,27 @@ public class RemoteCache implements AutoCloseable {
         downloads.add(Futures.immediateFailedFuture(e));
       }
     } else if (result.hasStderrDigest()) {
-      downloads.add(
-          Futures.transform(
-              cacheProtocol.downloadBlob(result.getStderrDigest(), outErr.getErrorStream()),
-              (d) -> null,
-              directExecutor()));
+      if (result.getStderrDigest().getSizeBytes() <= inMemoryCasMaxBlobSize) {
+        downloads.add(
+            Futures.transformAsync(
+                downloadBlob(result.getStderrDigest()),
+                (data) -> {
+                  try {
+                    outErr.getErrorStream().write(data);
+                    outErr.getErrorStream().flush();
+                    return Futures.immediateFuture(null);
+                  } catch (IOException e) {
+                    return Futures.immediateFailedFuture(e);
+                  }
+                },
+                directExecutor()));
+      } else {
+        downloads.add(
+            Futures.transform(
+                cacheProtocol.downloadBlob(result.getStderrDigest(), outErr.getErrorStream()),
+                (d) -> null,
+                directExecutor()));
+      }
     }
     return downloads;
   }

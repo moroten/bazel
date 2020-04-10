@@ -212,6 +212,8 @@ public final class RemoteModule extends BlazeModule {
         env.getOutputBase().getRelative(env.getRuntime().getProductName() + "-remote-logs");
     cleanAndCreateRemoteLogsDir(logDir);
 
+    RemoteCache.updateInMemoryStorage(env.getReporter(), remoteOptions);
+
     if ((enableHttpCache || enableDiskCache) && !enableGrpcCache) {
       Credentials creds;
       try {

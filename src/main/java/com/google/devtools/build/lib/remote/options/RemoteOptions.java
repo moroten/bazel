@@ -31,6 +31,8 @@ import com.google.devtools.common.options.OptionMetadataTag;
 import com.google.devtools.common.options.OptionsBase;
 import com.google.protobuf.TextFormat;
 import com.google.protobuf.TextFormat.ParseException;
+
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -260,6 +262,63 @@ public final class RemoteOptions extends OptionsBase {
           "A path to a directory where Bazel can read and write actions and action outputs. "
               + "If the directory does not exist, it will be created.")
   public PathFragment diskCache;
+
+  @Option(
+      name = "experimental_remote_in_memory_cas_max_blob_size",
+      defaultValue = "-1",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "The largest blob to be stored in the in memory content addressable storage, for example"
+              + " 262144 for 256 kiB. The default value is '-1' which means that the previous"
+              + " configured value is left unchanged.")
+  public long remoteInMemoryCasMaxBlobSize;
+
+  @Option(
+      name = "experimental_remote_in_memory_cas_expiration",
+      defaultValue = "0s",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "The longest time a blob is stored in the in memory content addressable storage without"
+              + " being accessed, e.g. '12h'. The default value is '0s' which means that the"
+              + " previous configured value is left unchanged.")
+  public Duration remoteInMemoryCasExpiration;
+
+  @Option(
+      name = "experimental_remote_in_memory_cas_size_bytes",
+      defaultValue = "-1",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "The total size in bytes of the in memory content addressable storage, for example"
+              + " '1073741824' for 1 GiB or '0' to disable the CAS, which is the startup state."
+              + " The default value is '-1' which means that the previous configured value is"
+              + " left unchanged.")
+  public long remoteInMemoryCasSizeBytes;
+
+  @Option(
+      name = "experimental_remote_in_memory_ac_expiration",
+      defaultValue = "0s",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "The longest time an action result is stored in the in memory action cache without"
+              + " being rewritten, e.g. '12h'. The default value is '0s' which means that the"
+              + " previous configured value is left unchanged.")
+  public Duration remoteInMemoryAcExpiration;
+
+  @Option(
+      name = "experimental_remote_in_memory_ac_size",
+      defaultValue = "-1",
+      documentationCategory = OptionDocumentationCategory.REMOTE,
+      effectTags = {OptionEffectTag.UNKNOWN},
+      help =
+          "The total number of entries in the in memory action cache. Each entry is about"
+              + " 142 bytes, so use for example 1048576 to allocate 142 MiB. The AC is disabled"
+              + " if the size is set to '0', which is the startup state. The default value is"
+              + " '-1' which means that the previous configured value is left unchanged.")
+  public long remoteInMemoryAcSize;
 
   @Option(
       name = "experimental_guard_against_concurrent_changes",
