@@ -37,6 +37,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -57,6 +58,7 @@ import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.RemoteCache.ActionResultMetadata.DirectoryMetadata;
 import com.google.devtools.build.lib.remote.RemoteCache.ActionResultMetadata.FileMetadata;
 import com.google.devtools.build.lib.remote.RemoteCache.ActionResultMetadata.SymlinkMetadata;
+import com.google.devtools.build.lib.remote.common.MissingDigestsFinder;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
 import com.google.devtools.build.lib.remote.options.RemoteOptions;
@@ -81,9 +83,11 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -91,7 +95,7 @@ import javax.annotation.Nullable;
 
 /** A cache for storing artifacts (input and output) as well as the output of running an action. */
 @ThreadSafety.ThreadSafe
-public class RemoteCache implements AutoCloseable {
+public class RemoteCache implements AutoCloseable, MissingDigestsFinder {
 
   /** See {@link SpawnExecutionContext#lockOutputFiles()}. */
   @FunctionalInterface
@@ -110,6 +114,8 @@ public class RemoteCache implements AutoCloseable {
   private static long inMemoryCasMaxBlobSize = 0;
   private static Duration inMemoryCasExpiration = Duration.ZERO;
   private static long inMemoryCasSizeBytes = 0;
+  /** A marker in the inMemoryCas that the blob exists remotely, but the data is missing. */
+  private static final byte[] inMemoryCasExistenceMarkerBlob = new byte[0];
   private static boolean inMemoryCasHasBeenConfigured = false;
   private static Cache<Digest, byte[]> inMemoryCas = CacheBuilder.newBuilder().maximumSize(0).build();
   private static Duration inMemoryAcExpiration = Duration.ZERO;
@@ -244,6 +250,37 @@ public class RemoteCache implements AutoCloseable {
     return upload(actionKey, action, command, execRoot, outputs, outErr, /* exitCode= */ 0);
   }
 
+  public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> allDigests) {
+    // Filter out the digests that are missing locally.
+    Collection<Digest> digestsToQuery = Sets.newHashSet(Iterables.filter(
+        allDigests,
+        (d) -> inMemoryCas.getIfPresent(d) == null));
+    ListenableFuture<ImmutableSet<Digest>> futureMissingDigests = cacheProtocol.findMissingDigests(digestsToQuery);
+    Futures.addCallback(
+        futureMissingDigests,
+        new FutureCallback<ImmutableSet<Digest>>() {
+          @Override
+          public void onSuccess(ImmutableSet<Digest> missingDigests) {
+            // Retain the digests that exists remotely.
+            digestsToQuery.removeAll(missingDigests);
+            for (Digest digest : digestsToQuery) {
+              // If the blob has not been cached, set at least a marker.
+              try {
+                inMemoryCas.get(digest, () -> inMemoryCasExistenceMarkerBlob);
+              } catch (ExecutionException e) {
+                // Should not occur, ignore.
+              }
+            }
+          }
+
+          @Override
+          public void onFailure(Throwable t) {
+          }
+        },
+        directExecutor());
+    return futureMissingDigests;
+  }
+
   private void uploadOutputs(
       Path execRoot,
       ActionKey actionKey,
@@ -270,7 +307,7 @@ public class RemoteCache implements AutoCloseable {
     digests.addAll(digestToFile.keySet());
     digests.addAll(digestToBlobs.keySet());
 
-    ImmutableSet<Digest> digestsToUpload = getFromFuture(cacheProtocol.findMissingDigests(digests));
+    ImmutableSet<Digest> digestsToUpload = getFromFuture(findMissingDigests(digests));
     ImmutableList.Builder<ListenableFuture<Void>> uploads = ImmutableList.builder();
     for (Digest digest : digestsToUpload) {
       Path file = digestToFile.get(digest);
@@ -376,7 +413,7 @@ public class RemoteCache implements AutoCloseable {
     }
     SettableFuture<byte[]> outerF = SettableFuture.create();
     byte[] cachedData = inMemoryCas.getIfPresent(digest);
-    if (cachedData != null) {
+    if (cachedData != null && cachedData != inMemoryCasExistenceMarkerBlob) {
       outerF.set(cachedData);
       return outerF;
     }

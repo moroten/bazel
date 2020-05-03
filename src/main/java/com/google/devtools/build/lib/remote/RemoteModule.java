@@ -49,6 +49,7 @@ import com.google.devtools.build.lib.exec.ExecutorBuilder;
 import com.google.devtools.build.lib.exec.ModuleActionContextRegistry;
 import com.google.devtools.build.lib.exec.SpawnStrategyRegistry;
 import com.google.devtools.build.lib.packages.TargetUtils;
+import com.google.devtools.build.lib.remote.common.MissingDigestsFinder;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient;
 import com.google.devtools.build.lib.remote.downloader.GrpcRemoteDownloader;
 import com.google.devtools.build.lib.remote.logging.LoggingInterceptor;
@@ -369,18 +370,10 @@ public final class RemoteModule extends BlazeModule {
             digestUtil,
             uploader.retain());
     uploader.release();
-    Context requestContext =
-        TracingMetadataUtils.contextWithMetadata(buildRequestId, invocationId, "bes-upload");
-    buildEventArtifactUploaderFactoryDelegate.init(
-        new ByteStreamBuildEventArtifactUploaderFactory(
-            uploader,
-            cacheClient,
-            cacheChannel.authority(),
-            requestContext,
-            remoteOptions.remoteInstanceName));
 
     Context repoContext =
         TracingMetadataUtils.contextWithMetadata(buildRequestId, invocationId, "repository_rule");
+    MissingDigestsFinder missingDigestsFinderForBuildEvents;
 
     if (enableRemoteExecution) {
       RemoteRetrier execRetrier =
@@ -394,6 +387,7 @@ public final class RemoteModule extends BlazeModule {
       execChannel.release();
       RemoteExecutionCache remoteCache =
           new RemoteExecutionCache(cacheClient, remoteOptions, digestUtil);
+      missingDigestsFinderForBuildEvents = remoteCache;
       actionContextProvider =
           RemoteActionContextProvider.createForRemoteExecution(
               env, remoteCache, remoteExecutor, retryScheduler, digestUtil, logDir);
@@ -423,10 +417,21 @@ public final class RemoteModule extends BlazeModule {
       }
 
       RemoteCache remoteCache = new RemoteCache(cacheClient, remoteOptions, digestUtil);
+      missingDigestsFinderForBuildEvents = remoteCachE,
       actionContextProvider =
           RemoteActionContextProvider.createForRemoteCaching(
               env, remoteCache, retryScheduler, digestUtil);
     }
+
+    Context requestContext =
+        TracingMetadataUtils.contextWithMetadata(buildRequestId, invocationId, "bes-upload");
+    buildEventArtifactUploaderFactoryDelegate.init(
+        new ByteStreamBuildEventArtifactUploaderFactory(
+            uploader,
+            missingDigestsFinderForBuildEvents,
+            cacheChannel.authority(),
+            requestContext,
+            remoteOptions.remoteInstanceName));
 
     if (enableRemoteDownloader) {
       remoteDownloaderSupplier.set(

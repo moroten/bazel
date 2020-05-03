@@ -74,8 +74,7 @@ public class RemoteExecutionCache extends RemoteCache {
       throws IOException, InterruptedException {
     Iterable<Digest> allDigests =
         Iterables.concat(merkleTree.getAllDigests(), additionalInputs.keySet());
-    ImmutableSet<Digest> missingDigests =
-        getFromFuture(cacheProtocol.findMissingDigests(allDigests));
+    ImmutableSet<Digest> missingDigests = getFromFuture(findMissingDigests(allDigests));
     Map<Digest, Path> filesToUpload = new HashMap<>();
     Map<Digest, ByteString> blobsToUpload = new HashMap<>();
     for (Digest missingDigest : missingDigests) {
